@@ -14,6 +14,8 @@ A small set of Windows PowerShell scripts for detecting connected game controlle
 
 Run the PowerShell scripts from Windows with administrative or user privileges as needed, and use the startup helper to enable automatic monitoring when you log in.
 
+When `controllertray.ps1` is running, right-click its system tray icon, choose **Choose game executable...**, and enable **Launch game on connect**. The selected `.exe` is saved in `controller-game.txt` beside the scripts.
+
 ## License
 
 Free for personal, educational, and non-commercial use. Commercial use, redistribution as part of a commercial product, or use by a commercial organization requires a paid license.

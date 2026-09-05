@@ -5,18 +5,31 @@ $scriptPath = $MyInvocation.MyCommand.Path
 $scriptDirectory = Split-Path -Parent $scriptPath
 $bat = Join-Path $scriptDirectory "controllerconnected.bat"
 $log = Join-Path $scriptDirectory "controller.log"
+$gamePathFile = Join-Path $scriptDirectory "controller-game.txt"
+$launchGameFile = Join-Path $scriptDirectory "launch-game-on-connect.txt"
 $monitorSwitcher = "C:\Users\pat\Documents\Setups\MonitorProfileSwitcher_v0700\MonitorSwitcher.exe"
 $tvProfile = "C:\Users\pat\AppData\Roaming\MonitorSwitcher\Profiles\TV.xml"
 $startupShortcut = Join-Path ([Environment]::GetFolderPath("Startup")) "PS5 Controller Monitor.lnk"
+$launchGameValue = if (Test-Path $launchGameFile) { Get-Content $launchGameFile -Raw } else { "" }
+$gamePathValue = if (Test-Path $gamePathFile) { Get-Content $gamePathFile -Raw } else { "" }
+if ($null -eq $launchGameValue) { $launchGameValue = "" }
+if ($null -eq $gamePathValue) { $gamePathValue = "" }
 
 $state = [hashtable]::Synchronized(@{
     Connected = $false
     HasPreviousState = $false
     Monitoring = $true
     SwitchToTv = $true
+    LaunchGame = $launchGameValue.Trim() -eq "true"
+    GamePath = $gamePathValue.Trim()
 })
 
+function Write-TrayLog([string]$message) {
+    Add-Content -Path $log -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $message"
+}
+
 function Test-ControllerConnected {
+    Import-Module PnpDevice -ErrorAction SilentlyContinue
     $controllers = @(Get-PnpDevice -Class HIDClass -ErrorAction SilentlyContinue | Where-Object {
         $_.HardwareID -match "HID_DEVICE_SYSTEM_GAME"
     })
@@ -39,6 +52,26 @@ function Switch-ToTvProfile {
     }
 
     Start-Process -FilePath $monitorSwitcher -ArgumentList "-load:`"$tvProfile`"" -WindowStyle Hidden -Wait
+}
+
+function Set-GamePath([string]$path) {
+    $state.GamePath = $path
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        if (Test-Path $gamePathFile) {
+            Remove-Item $gamePathFile -Force
+        }
+        return
+    }
+
+    Set-Content -Path $gamePathFile -Value $path -Encoding UTF8
+}
+
+function Launch-ConfiguredGame {
+    if ([string]::IsNullOrWhiteSpace($state.GamePath) -or -not (Test-Path $state.GamePath -PathType Leaf)) {
+        return
+    }
+
+    Start-Process -FilePath $state.GamePath -WorkingDirectory (Split-Path $state.GamePath -Parent)
 }
 
 function Set-StartupShortcut([bool]$enabled) {
@@ -106,6 +139,15 @@ $tvItem = $contextMenu.Items.Add("Switch to TV profile on connect")
 $tvItem.CheckOnClick = $true
 $tvItem.Checked = $true
 
+$launchGameItem = $contextMenu.Items.Add("Launch game on connect")
+$launchGameItem.CheckOnClick = $true
+$launchGameItem.Checked = $state.LaunchGame
+$selectedGameItem = $contextMenu.Items.Add("Selected game: $(if ([string]::IsNullOrWhiteSpace($state.GamePath)) { 'none' } else { [System.IO.Path]::GetFileName($state.GamePath) })")
+$selectedGameItem.Enabled = $false
+$chooseGameItem = $contextMenu.Items.Add("Choose game executable...")
+$clearGameItem = $contextMenu.Items.Add("Clear game executable")
+$clearGameItem.Enabled = -not [string]::IsNullOrWhiteSpace($state.GamePath)
+
 $startupItem = $contextMenu.Items.Add("Launch at login")
 $startupItem.CheckOnClick = $true
 $startupItem.Checked = Test-Path $startupShortcut
@@ -137,16 +179,30 @@ $checkController = {
         return
     }
 
-    $isConnected = Test-ControllerConnected
-    if (-not $state.HasPreviousState -or $isConnected -ne $state.Connected) {
-        $state.Connected = $isConnected
-        $state.HasPreviousState = $true
-        Set-TrayIcon $isConnected
-        Write-ControllerState $isConnected
-        if ($isConnected -and $state.SwitchToTv) {
-            Switch-ToTvProfile
+    try {
+        $isConnected = Test-ControllerConnected
+        if (-not $state.HasPreviousState -or $isConnected -ne $state.Connected) {
+            $state.Connected = $isConnected
+            $state.HasPreviousState = $true
+            Set-TrayIcon $isConnected
+            & $updateStatus
+
+            try {
+                Write-ControllerState $isConnected
+                if ($isConnected -and $state.SwitchToTv) {
+                    Switch-ToTvProfile
+                }
+                if ($isConnected -and $state.LaunchGame) {
+                    Launch-ConfiguredGame
+                }
+            } catch {
+                Write-TrayLog "Tray action failed: $($_.Exception.Message)"
+            }
         }
-        & $updateStatus
+    } catch {
+        $statusItem.Text = "Status: error"
+        $notifyIcon.Text = "PS5 Controller: error"
+        Write-TrayLog "Tray check failed: $($_.Exception.Message)"
     }
 }
 
@@ -159,6 +215,30 @@ $monitorItem.Add_Click({
 })
 
 $tvItem.Add_Click({ $state.SwitchToTv = $tvItem.Checked })
+$launchGameItem.Add_Click({
+    $state.LaunchGame = $launchGameItem.Checked
+    Set-Content -Path $launchGameFile -Value $state.LaunchGame -Encoding UTF8
+})
+$chooseGameItem.Add_Click({
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Filter = "Game executables (*.exe)|*.exe|All files (*.*)|*.*"
+    $dialog.Title = "Choose a game executable"
+    if (-not [string]::IsNullOrWhiteSpace($state.GamePath) -and (Test-Path $state.GamePath)) {
+        $dialog.FileName = $state.GamePath
+    }
+
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        Set-GamePath $dialog.FileName
+        $selectedGameItem.Text = "Selected game: $([System.IO.Path]::GetFileName($state.GamePath))"
+        $clearGameItem.Enabled = $true
+    }
+    $dialog.Dispose()
+})
+$clearGameItem.Add_Click({
+    Set-GamePath ""
+    $selectedGameItem.Text = "Selected game: none"
+    $clearGameItem.Enabled = $false
+})
 $startupItem.Add_Click({ Set-StartupShortcut $startupItem.Checked })
 $refreshItem.Add_Click({
     $state.HasPreviousState = $false
